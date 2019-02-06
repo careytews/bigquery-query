@@ -1,0 +1,141 @@
+#!/usr/bin/env python
+
+# Needed:
+#   pip install --upgrade google-api-python-client
+
+import json
+import sys
+import requests
+from tabulate import tabulate
+import datetime
+
+from httplib2 import Http
+from oauth2client.service_account import ServiceAccountCredentials
+from apiclient.discovery import build
+import googleapiclient.errors
+
+# Credential requirements
+private="private.json"
+project = None
+scopes = ['https://www.googleapis.com/auth/bigquery']
+
+# Use project from the private JSON file.
+if project == None:
+    project = json.loads(open(private,'r').read())['project_id']
+
+# Get creds
+credentials = ServiceAccountCredentials.from_json_keyfile_name(private,
+                                                               scopes=scopes)
+
+# Authorise HTTP requests.
+http = Http()
+http_auth = credentials.authorize(http)
+
+# Get BigQuery service.
+service = build('bigquery', 'v2', http=http_auth)
+jobs = service.jobs()
+
+# Construct query
+query = """
+SELECT id, time, device, header.host, 
+   substr(header.useragent, 1, 40), 
+   header.location, header.origin, substr(header.accept, 1, 25),
+   header.acceptcharset
+FROM [cyberprobe.cyberprobe] WHERE action = 'http_request'
+ORDER BY time DESC LIMIT 100
+"""
+
+# Query body
+body = {
+    "kind": "bigquery#queryRequest",
+    "query": query,
+    "timeoutMs": 1000
+}
+
+# Run query
+job = jobs.query(projectId=project, body=body).execute(http)
+
+# Get JobID
+jobid = job["jobReference"]
+
+# Not very helpful response.
+if job.has_key("errors") and len(job["errors"]) != 0:
+    sys.stderr.write("There were errors\n")
+    sys.exit(1)
+
+# If Job is complete...
+if job["jobComplete"]:
+    # ... use schema and data from queryResult...
+    schema = job["schema"]
+    rows = job["rows"]
+else:
+
+    # ...loop until we have results...
+    sys.stderr.write("Waiting...\n")
+
+    while True:
+
+        # Get query results
+        job = jobs.getQueryResults(jobId=jobid["jobId"],
+                                   projectId=jobid["projectId"],
+                                   timeoutMs=1000).execute(http)
+
+        # If job complete...
+        if job["jobComplete"]:
+
+            # We have the results in the response.
+            schema = job["schema"]
+            rows = job["rows"]
+            break
+
+        # Job not complete, loop round.
+        sys.stderr.write("Waiting...\n")
+
+# Recursive schema reviewer
+def review_schema(schema, fields, types, prefix=""):
+    for field in schema["fields"]:
+        if field.has_key("fields"):
+            review_schema(field["fields"], fields, types,
+                          prefix + field["name"] + ".")
+        else:
+            name = prefix + field["name"]
+            fields.append(name)
+            types[name] = field["type"]
+
+# Assemble schema and field list
+fields = []
+types={}
+review_schema(schema, fields, types)
+
+# Human-readable headers for my header list
+headers=["ID", "Time", "Device", "Host", "User-Agent",
+         "Location", "Origin", "Accept", "Accept-Charset"]
+
+# Convert data to table
+data = []
+
+# Iterate over rows...
+for row in rows:
+
+    dr = []
+    i=0
+    for field in row["f"]:
+
+        # Field type is...
+        if types[fields[i]] == "TIMESTAMP":
+
+            # ... timestamp: Convert to human-readable form
+            ts = datetime.datetime.fromtimestamp(float(field["v"]))
+            ts = ts.strftime("%Y-%m-%dT%H:%M:%S")
+            dr.append(ts)
+        else:
+
+            # ...anything else: Just use the field value.
+            dr.append(field["v"])
+            
+        i = i + 1
+
+    data.append(dr)
+
+# Print tabular form.
+print tabulate(data, headers=headers)

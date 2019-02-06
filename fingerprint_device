@@ -1,0 +1,163 @@
+#!/usr/bin/env python
+
+# Needed:
+#   pip install --upgrade google-api-python-client
+
+import json
+import sys
+import requests
+from tabulate import tabulate
+import datetime
+import md5
+
+from httplib2 import Http
+from oauth2client.service_account import ServiceAccountCredentials
+from apiclient.discovery import build
+import googleapiclient.errors
+
+try:
+    device=sys.argv[1]
+except:
+    sys.stderr.write("Usage:\n\tfingerprints <device>\n")
+    sys.exit(1)
+
+# Credential requirements
+private="private.json"
+project = None
+scopes = ['https://www.googleapis.com/auth/bigquery']
+
+# Use project from the private JSON file.
+if project == None:
+    project = json.loads(open(private,'r').read())['project_id']
+
+# Get creds
+credentials = ServiceAccountCredentials.from_json_keyfile_name(private,
+                                                               scopes=scopes)
+
+# Authorise HTTP requests.
+http = Http()
+http_auth = credentials.authorize(http)
+
+# Get BigQuery service.
+service = build('bigquery', 'v2', http=http_auth)
+jobs = service.jobs()
+
+# Construct query
+query = """
+SELECT id, time, header.host, header.useragent, header.location, 
+   header.origin, header.accept, header.acceptcharset, 
+   header.acceptlanguage, header.connection
+FROM [cyberprobe.cyberprobe]
+WHERE action = 'http_request' AND device = '%s'
+ORDER BY time DESC LIMIT 50000
+""" % device
+
+# Query body
+body = {
+    "kind": "bigquery#queryRequest",
+    "query": query,
+    "timeoutMs": 1000
+}
+
+# Run query
+job = jobs.query(projectId=project, body=body).execute(http)
+
+# Get JobID
+jobid = job["jobReference"]
+
+# Not very helpful response.
+if job.has_key("errors") and len(job["errors"]) != 0:
+    sys.stderr.write("There were errors\n")
+    sys.exit(1)
+
+# If Job is complete...
+if job["jobComplete"]:
+    # ... use schema and data from queryResult...
+    schema = job["schema"]
+    if job.has_key("rows"):
+        rows = job["rows"]
+    else:
+        rows = []
+else:
+
+    # ...loop until we have results...
+    sys.stderr.write("Waiting...\n")
+
+    while True:
+
+        # Get query results
+        job = jobs.getQueryResults(jobId=jobid["jobId"],
+                                   projectId=jobid["projectId"],
+                                   timeoutMs=1000).execute(http)
+
+        # If job complete...
+        if job["jobComplete"]:
+
+            # We have the results in the response.
+            schema = job["schema"]
+            if job.has_key("rows"):
+                rows = job["rows"]
+            else:
+                rows = []
+            break
+
+        # Job not complete, loop round.
+        sys.stderr.write("Waiting...\n")
+
+# Recursive schema reviewer
+def review_schema(schema, fields, index, types, prefix=""):
+    for field in schema["fields"]:
+        if field.has_key("fields"):
+            review_schema(field["fields"], fields, index, types,
+                          prefix + field["name"] + ".")
+        else:
+            name = prefix + field["name"]
+            index[name] = len(fields)
+            fields.append(name)
+            types[name] = field["type"]
+
+# Assemble schema and field list
+fields = []
+index = {}
+types={}
+review_schema(schema, fields, index, types)
+
+# Collate by host
+fingerprints = {}
+
+# Iterate over rows...
+for row in rows:
+
+    row = row["f"]
+    host = row[index["header_host"]]["v"]
+    
+    fingerprint = [
+        { "device": device },
+        { "host": host },
+        { "useragent": row[index["header_useragent"]]["v"] },
+        { "location": row[index["header_location"]]["v"] },
+        { "origin": row[index["header_origin"]]["v"] },
+        { "accept": row[index["header_accept"]]["v"] },
+        { "acceptcharset": row[index["header_acceptcharset"]]["v"] },
+        { "acceptlanguage": row[index["header_acceptlanguage"]]["v"] },
+        { "connection": row[index["header_connection"]]["v"] }
+    ]
+
+    fingerprint = md5.new(json.dumps(fingerprint)).hexdigest()
+
+    if not fingerprints.has_key(host):
+        fingerprints[host] = {}
+
+    if fingerprints[host].has_key(fingerprint):
+        fingerprints[host][fingerprint] = fingerprints[host][fingerprint] + 1
+    else:
+        fingerprints[host][fingerprint] = 1
+
+for host in fingerprints:
+    h = host
+    for fp in fingerprints[host]:
+        print "%-60s %-36s %d" % (h, fp, fingerprints[host][fp])
+        h = ""
+
+
+
